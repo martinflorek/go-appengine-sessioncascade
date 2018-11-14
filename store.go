@@ -11,9 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/appengine"
-	"google.golang.org/appengine/datastore"
+	"cloud.google.com/go/firestore"
 	"google.golang.org/appengine/memcache"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/dsoprea/go-logging"
 	gcontext "github.com/gorilla/context"
@@ -29,6 +31,7 @@ const (
 
 // Config
 var (
+	fsClient                       *firestore.Client
 	doDisplayLoggingRaw            = os.Getenv(CkDoDisplayLogging)
 	maxMemcacheSessionSizeBytesRaw = os.Getenv(CkMaxMemcacheSessionSizeBytes)
 
@@ -39,12 +42,12 @@ var (
 const (
 	RequestBackend   = 1 << iota
 	MemcacheBackend  = 1 << iota
-	DatastoreBackend = 1 << iota
+	FirestoreBackend = 1 << iota
 )
 
 const (
 	// In most cases we won't want to use the "request" backend. Though it's
-	// nice to prevent hitting Memcache or Datastore if the information is
+	// nice to prevent hitting Memcache or Firestore if the information is
 	// requested multiple times during a single request, it won't be updated by
 	// concurrent requests from the same user/browser. The distributed backends
 	// will receive the updates but the "Request" backend will preempt it with
@@ -52,8 +55,8 @@ const (
 	// like the Channel API, to receive fault notifications from other requests
 	// that do an update so that we can know to update the information in the
 	// request.
-	DistributedBackends = MemcacheBackend | DatastoreBackend
-	AllBackends         = RequestBackend | MemcacheBackend | DatastoreBackend
+	DistributedBackends = MemcacheBackend | FirestoreBackend
+	AllBackends         = RequestBackend | MemcacheBackend | FirestoreBackend
 
 	// Amount of time for cookies/redis keys to expire.
 	DefaultExpireSeconds = 86400 * 30
@@ -72,7 +75,7 @@ var (
 	storeLog = log.NewLogger("sc.store")
 )
 
-// For datastore.
+// For firestore.
 type sessionKind struct {
 	Value     []byte
 	ExpiresAt time.Time
@@ -166,7 +169,7 @@ func (cs *CascadeStore) Get(r *http.Request, name string) (*sessions.Session, er
 //
 // See gorilla/sessions FilesystemStore.New().
 func (cs *CascadeStore) New(r *http.Request, name string) (session *sessions.Session, err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -200,7 +203,7 @@ func (cs *CascadeStore) New(r *http.Request, name string) (session *sessions.Ses
 
 // Save adds a single session to the response.
 func (cs *CascadeStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) (err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -256,7 +259,7 @@ func (cs *CascadeStore) serializeSession(session *sessions.Session) []byte {
 }
 
 func (cs *CascadeStore) setInRequest(r *http.Request, session *sessions.Session, key string, serialized []byte) (err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -294,7 +297,7 @@ func (cs *CascadeStore) setInRequest(r *http.Request, session *sessions.Session,
 }
 
 func (cs *CascadeStore) setInMemcache(r *http.Request, session *sessions.Session, key string, serialized []byte) (err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -338,7 +341,7 @@ func (cs *CascadeStore) setInMemcache(r *http.Request, session *sessions.Session
 
 // save stores the session in redis.
 func (cs *CascadeStore) save(r *http.Request, session *sessions.Session) (err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -368,16 +371,16 @@ func (cs *CascadeStore) save(r *http.Request, session *sessions.Session) (err er
 	expires := time.Second * time.Duration(age)
 	expiresAt := time.Now().Add(expires)
 
-	if (cs.backendTypes & DatastoreBackend) > 0 {
-		storeLog.Debugf(ctx, "Writing session to Datastore: [%s]", key)
+	if (cs.backendTypes & FirestoreBackend) > 0 {
+		storeLog.Debugf(ctx, "Writing session to Firestore: [%s]", key)
 
 		s := &sessionKind{
 			Value:     serialized,
 			ExpiresAt: expiresAt,
 		}
 
-		k := datastore.NewKey(ctx, "Session", key, 0, nil)
-		if _, err := datastore.Put(ctx, k, s); err != nil {
+		docref := fsClient.Collection("Session").Doc(key)
+		if _, err := docref.Set(ctx, s); err != nil {
 			log.Panic(err)
 		}
 	}
@@ -388,7 +391,7 @@ func (cs *CascadeStore) save(r *http.Request, session *sessions.Session) (err er
 // load reads the session from redis.
 // returns true if there is a sessoin data in DB
 func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (success bool, err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -440,21 +443,30 @@ func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (succes
 		}
 	}
 
-	if value == nil && (cs.backendTypes&DatastoreBackend) > 0 {
-		// Try datastore.
+	if value == nil && (cs.backendTypes&FirestoreBackend) > 0 {
+		// Try firestore.
 
-		k := datastore.NewKey(ctx, "Session", key, 0, nil)
-		s := &sessionKind{}
-		if err := datastore.Get(ctx, k, s); err != nil {
-			if err == datastore.ErrNoSuchEntity {
-				storeLog.Debugf(ctx, "Could not find session in Datastore: [%s]", key)
+		doc, err := fsClient.Collection("Session").Doc(key).Get(ctx)
+		var s sessionKind
+		if err != nil {
+			// TODO handle not found
+			if s, ok := status.FromError(err); ok {
+				if s.Code() == codes.NotFound {
+					storeLog.Debugf(ctx, "Could not find session in Firestore: [%s]", key)
+				} else {
+					log.Panic(err)
+				}
 			} else {
 				log.Panic(err)
 			}
 		} else if err == nil {
+			if err := doc.DataTo(&s); err != nil {
+				log.Panic(err)
+			}
+
 			if now.Before(s.ExpiresAt) {
 				value = s.Value
-				storeLog.Debugf(ctx, "Found session in Datastore: [%s]", key)
+				storeLog.Debugf(ctx, "Found session in Firestore: [%s]", key)
 			} else if err := cs.delete(r, session); err != nil {
 				log.Panic(err)
 			}
@@ -474,7 +486,7 @@ func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (succes
 
 // delete removes keys from redis if MaxAge<0
 func (cs *CascadeStore) delete(r *http.Request, session *sessions.Session) (err error) {
-	ctx := appengine.NewContext(r)
+	ctx := r.Context()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -504,12 +516,11 @@ func (cs *CascadeStore) delete(r *http.Request, session *sessions.Session) (err 
 		}
 	}
 
-	if (cs.backendTypes & DatastoreBackend) > 0 {
-		storeLog.Debugf(ctx, "Removing session from Datastore: [%s]", key)
+	if (cs.backendTypes & FirestoreBackend) > 0 {
+		storeLog.Debugf(ctx, "Removing session from Firestore: [%s]", key)
 
-		k := datastore.NewKey(ctx, "Session", key, 0, nil)
-		if err := datastore.Delete(ctx, k); err != nil {
-			storeLog.Warningf(ctx, "Tried and failed to remove old session from Datastore: [%s]", key)
+		if _, err := fsClient.Collection("Session").Doc(key).Delete(ctx); err != nil {
+			storeLog.Warningf(ctx, "Tried and failed to remove old session from Firestore: [%s]", key)
 		}
 	}
 
@@ -542,4 +553,8 @@ func init() {
 			maxMemcacheSessionSizeBytes = p
 		}
 	}
+}
+
+func SetupFirestore(fsc *firestore.Client) {
+	fsClient = fsc
 }
