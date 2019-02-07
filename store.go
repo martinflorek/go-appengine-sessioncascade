@@ -392,6 +392,7 @@ func (cs *CascadeStore) save(r *http.Request, session *sessions.Session) (err er
 // returns true if there is a sessoin data in DB
 func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (success bool, err error) {
 	ctx := r.Context()
+	foundInMemCache := false
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -435,6 +436,7 @@ func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (succes
 			}
 		} else if err == nil {
 			value = item.Value
+			foundInMemCache = true
 			storeLog.Debugf(ctx, "Found session in Memcache: [%s]", key)
 
 			if err := cs.setInRequest(r, session, key, value); err != nil {
@@ -470,6 +472,13 @@ func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (succes
 			} else if err := cs.delete(r, session); err != nil {
 				log.Panic(err)
 			}
+		}
+	}
+
+	// Set in memcache if it was not loaded from it
+	if value != nil && !foundInMemCache && (cs.backendTypes&MemcacheBackend) > 0 {
+		if err := cs.setInMemcache(r, session, key, value); err != nil {
+			panic(err)
 		}
 	}
 
