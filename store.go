@@ -27,6 +27,7 @@ import (
 const (
 	CkDoDisplayLogging            = "SessionCascadeDisplayLogging"
 	CkMaxMemcacheSessionSizeBytes = "MaxMemcacheSessionSizeBytes"
+	fireStoreSessionCollection    = "gae_sessions"
 )
 
 // Config
@@ -379,7 +380,7 @@ func (cs *CascadeStore) save(r *http.Request, session *sessions.Session) (err er
 			ExpiresAt: expiresAt,
 		}
 
-		docref := fsClient.Collection("Session").Doc(key)
+		docref := fsClient.Collection(fireStoreSessionCollection).Doc(key)
 		if _, err := docref.Set(ctx, s); err != nil {
 			log.Panic(err)
 		}
@@ -448,7 +449,7 @@ func (cs *CascadeStore) load(r *http.Request, session *sessions.Session) (succes
 	if value == nil && (cs.backendTypes&FirestoreBackend) > 0 {
 		// Try firestore.
 
-		doc, err := fsClient.Collection("Session").Doc(key).Get(ctx)
+		doc, err := fsClient.Collection(fireStoreSessionCollection).Doc(key).Get(ctx)
 		var s sessionKind
 		if err != nil {
 			// TODO handle not found
@@ -528,7 +529,7 @@ func (cs *CascadeStore) delete(r *http.Request, session *sessions.Session) (err 
 	if (cs.backendTypes & FirestoreBackend) > 0 {
 		storeLog.Debugf(ctx, "Removing session from Firestore: [%s]", key)
 
-		if _, err := fsClient.Collection("Session").Doc(key).Delete(ctx); err != nil {
+		if _, err := fsClient.Collection(fireStoreSessionCollection).Doc(key).Delete(ctx); err != nil {
 			storeLog.Warningf(ctx, "Tried and failed to remove old session from Firestore: [%s]", key)
 		}
 	}
